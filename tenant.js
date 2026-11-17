@@ -535,16 +535,28 @@
     return "Giriş yapılamadı. Bilgileri kontrol edip tekrar deneyin.";
   }
 
+  function paintMap() {
+    if (typeof window.refreshMapLayout === "function") window.refreshMapLayout();
+  }
+
+  function afterLayout(done) {
+    requestAnimationFrame(() => requestAnimationFrame(done));
+  }
+
   async function startApp() {
     if (appStarted) return;
     appStarted = true;
     showApp();
+    await new Promise((resolve) => afterLayout(resolve));
+    paintMap();
     try {
       await boot();
     } catch (err) {
       console.error(err);
       setStatus("Veriler yüklenemedi.");
     }
+    paintMap();
+    setTimeout(paintMap, 200);
   }
 
   async function requireAuth() {
@@ -564,7 +576,9 @@
         return;
       }
       if (event === "INITIAL_SESSION" || event === "SIGNED_IN" || event === "TOKEN_REFRESHED") {
-        startApp();
+        setTimeout(() => {
+          startApp();
+        }, 0);
       }
     });
     const { data, error } = await client.auth.getSession();

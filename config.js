@@ -6,7 +6,7 @@ window.SUPABASE_CONFIG = {
   "url": "https://zzdlmzzbbrkqcebpxihm.supabase.co",
   "publishableKey": "sb_publishable_PG6xhcOv3WPHhtB8BUOjJQ_xAvVAz31",
   "companySlug": "tepe",
-  "lockedRegion": "ankara-servis",
-  "hideRegionSelector": true,
-  "siteTitle": "Ankara Servis - İK Harita"
+  "lockedRegion": "",
+  "hideRegionSelector": false,
+  "siteTitle": "İK Harita"
 };

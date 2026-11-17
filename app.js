@@ -1860,6 +1860,13 @@ L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
   maxZoom: 19,
   subdomains: "abc",
 }).addTo(map);
+
+function refreshMapLayout() {
+  const container = map.getContainer();
+  if (!container || container.clientWidth < 2 || container.clientHeight < 2) return;
+  map.invalidateSize({ animate: false });
+}
+window.refreshMapLayout = refreshMapLayout;
 L.control.scale({ metric: true, imperial: false, position: "bottomright" }).addTo(map);
 
 const projectIcon = L.divIcon({
@@ -3577,6 +3584,7 @@ function applySupabaseRegion(bundle) {
   }
   if (currentMode === "origin-to-project" && !originSelect.value) renderProjectCatalog();
   else runSearch();
+  refreshMapLayout();
 }
 
 // İlk yükleme. Supabase ayarı varsa tenant.js bölgeyi çeker;
