@@ -46,6 +46,28 @@ function saveProjectsCache() {
 // Modallardan kaydedince önce Sheet'e yazılır, sonra bu setler yenilenir.
 let URGENT_PROJECT_IDS = new Set();
 let INACTIVE_PROJECT_IDS = new Set();
+/** Supabase'den gelen kayıtlarda active/urgent hiç yoksa proje açık kabul edilir. */
+function normalizeProjectRecord(project) {
+  const flag = (value, whenMissing) => {
+    if (value === undefined || value === null || value === "") return whenMissing;
+    if (typeof value === "string") {
+      const text = value.trim().toLowerCase();
+      return text === "true" || text === "1" || text === "evet";
+    }
+    return Boolean(value);
+  };
+  project.active = flag(project.active, project.referral !== "Aktif değil");
+  project.urgent = flag(project.urgent, false);
+  if (project.lat != null) project.lat = Number(project.lat);
+  if (project.lng != null) project.lng = Number(project.lng);
+  if (!project.ageRange && project.ageMin != null && project.ageMin !== "" && project.ageMax != null && project.ageMax !== "") {
+    const min = Number(project.ageMin);
+    const max = Number(project.ageMax);
+    if (Number.isFinite(min) && Number.isFinite(max)) project.ageRange = { min, max };
+  }
+  return project;
+}
+
 function recomputeUrgentInactiveSets() {
   URGENT_PROJECT_IDS = new Set(ANKARA_DATA.projects.filter((p) => p.urgent).map((p) => p.id));
   INACTIVE_PROJECT_IDS = new Set(ANKARA_DATA.projects.filter((p) => !p.active).map((p) => p.id));
@@ -62,6 +84,9 @@ function activeProjects() {
 // tarayıcının otomatik preflight göndermesine ve isteğin başarısız olmasına
 // yol açardı. Gövde yine de geçerli JSON metni olarak gönderilir.
 async function postToSheet(body) {
+  if (window.usingSupabaseTenant && window.TenantStore && typeof TenantStore.write === "function") {
+    return TenantStore.write(body);
+  }
   const res = await fetch(SHEET_API_URL, {
     method: "POST",
     headers: { "Content-Type": "text/plain;charset=utf-8" },
@@ -131,15 +156,24 @@ function nearestTransitStop(lat, lng) {
 // 1) YARDIMCI ARAMA TABLOLARI
 // ---------------------------------------------------------------------------
 
-const stopsById = Object.fromEntries(ANKARA_DATA.transitStops.map((s) => [s.id, s]));
-const linesByStopId = {}; // stopId -> [lineId, ...]
-ANKARA_DATA.transitLines.forEach((line) => {
-  line.stopIds.forEach((stopId) => {
-    (linesByStopId[stopId] = linesByStopId[stopId] || []).push(line.id);
+let stopsById = {};
+let linesByStopId = {}; // stopId -> [lineId, ...]
+let linesById = {};
+let HUBS = new Set();
+
+function rebuildTransitIndexes() {
+  stopApproxCoordsCache = null;
+  stopsById = Object.fromEntries((ANKARA_DATA.transitStops || []).map((s) => [s.id, s]));
+  linesByStopId = {};
+  (ANKARA_DATA.transitLines || []).forEach((line) => {
+    (line.stopIds || []).forEach((stopId) => {
+      (linesByStopId[stopId] = linesByStopId[stopId] || []).push(line.id);
+    });
   });
-});
-const linesById = Object.fromEntries(ANKARA_DATA.transitLines.map((l) => [l.id, l]));
-const HUBS = new Set(ANKARA_DATA.hubStopIds);
+  linesById = Object.fromEntries((ANKARA_DATA.transitLines || []).map((l) => [l.id, l]));
+  HUBS = new Set(ANKARA_DATA.hubStopIds || []);
+}
+rebuildTransitIndexes();
 
 function stopName(stopId) {
   return stopsById[stopId] ? stopsById[stopId].name : stopId;
@@ -201,7 +235,10 @@ function roundTo5(n) {
 // metro hızı sonradan 33'e çıkarıldığı için "otobüs metroyla yapay başa baş"
 // itirazı artık geçerli değil (Etlik→Bilkent Center hâlâ metro tabanlı, Etlik→
 // Medical Park hâlâ 261→480 — doğrulandı). Pursaklar→Nazende 139→120 dk.
-const MODE_SPEED_KMH = { otobus: 20, metro: 33, ankaray: 33, tren: 45, dolmus: 20 };
+const MODE_SPEED_KMH = {
+  otobus: 20, metro: 33, ankaray: 33, tren: 45, dolmus: 20,
+  tramvay: 18, marmaray: 40, metrobus: 28, funikuler: 15, vapur: 15,
+};
 // Havalimanı ekspresi (442) ve D140 / Özal Bulvarı üzerindeki uzun etaplar
 // şehir içi 20 km/s ile gidilmez — durak arası birkaç kilometre, ışıksız
 // arter. 48 km/s, istenen 45-50 bandının ortası. Kısa (2.2 km altı) durak
@@ -246,7 +283,10 @@ const STOP_DWELL_MIN = 0.4;
 // Her yeni binişte (ilk biniş ve aktarma) bekleme = o hattın sefer aralığı / 2.
 // Aralık önce LINE_HEADWAY_MIN'den, yoksa mod ortalamasından gelir. Aynı hatta
 // kalmak bedavadır; araç zaten yolundadır, ikinci kez beklenmez.
-const MODE_HEADWAY_MIN = { otobus: 12, metro: 6, ankaray: 6, tren: 15, dolmus: 10 };
+const MODE_HEADWAY_MIN = {
+  otobus: 12, metro: 6, ankaray: 6, tren: 15, dolmus: 10,
+  tramvay: 8, marmaray: 12, metrobus: 3, funikuler: 8, vapur: 20,
+};
 // Hat bazlı sefer aralığı (dakika). Bekleme her yeni binişte aralığın yarısıdır
 // (ilk biniş ve aktarma). Tabloda olmayan hat, mod ortalamasına düşer.
 // 442 gündüz yaklaşık 24 dk'da bir kalktığı için yarım aralık 12 dk kalır;
@@ -1375,44 +1415,55 @@ function loadDolmusLines() {
     .catch(() => ({ stops: [], lines: [] }));
 }
 
+/**
+ * Hat/durak ağını grafa kurar. Supabase bölgesi bunu bellekten verir;
+ * yerel JSON yalnızca Supabase ayarı yoksa yedek olarak çağrılır.
+ * Dolmuş hatları ana süreye karışmaz, ikinci grafta alternatif olarak durur.
+ */
+function installTransitNetwork(network, options) {
+  const data = {
+    stops: (network && network.stops) || [],
+    lines: (network && network.lines) || [],
+  };
+  localTransitNetwork = data;
+  localStopsById = Object.fromEntries(data.stops.map((s) => [s.id, s]));
+  linesByLocalStopId = {};
+  data.lines.forEach((line) => {
+    (line.stopIds || []).forEach((sid) => {
+      (linesByLocalStopId[sid] = linesByLocalStopId[sid] || []).push(line);
+    });
+  });
+  const geometry = {};
+  data.lines.forEach((line) => {
+    if (line.geometry && line.id) geometry[line.id] = line.geometry;
+  });
+  if (Object.keys(geometry).length) {
+    localTransitGeometry = geometry;
+    localTransitGeometryPromise = Promise.resolve(geometry);
+  }
+  transitGraph = buildTransitGraph(data, { excludeModes: new Set(["dolmus"]) });
+  transitGraphWithDolmus = buildTransitGraph(data, {});
+  localTransitNetworkPromise = Promise.resolve(data);
+  if (!(options && options.silent) && typeof runSearch === "function") runSearch();
+  return data;
+}
+
 function loadLocalTransitNetwork() {
   if (localTransitNetworkPromise) return localTransitNetworkPromise;
   localTransitNetworkPromise = Promise.all([
     fetch("transit_network.json?v=5").then((res) => res.json()),
     loadDolmusLines(),
   ])
-    .then(([egoData, dolmusData]) => {
-      const data = {
-        stops: egoData.stops.concat(dolmusData.stops),
-        lines: egoData.lines.concat(dolmusData.lines),
-      };
-      localTransitNetwork = data;
-      localStopsById = Object.fromEntries(data.stops.map((s) => [s.id, s]));
-      linesByLocalStopId = {};
-      data.lines.forEach((line) => {
-        (line.stopIds || []).forEach((sid) => {
-          (linesByLocalStopId[sid] = linesByLocalStopId[sid] || []).push(line);
-        });
-      });
-      // Gerçek graf tabanlı rota motorunu (bkz. §2) bu veriyle kur. Kurulana
-      // kadar estimateTransit() kaba bir geçici tahmin döner; kurulur kurulmaz
-      // (henüz bir arama gösteriliyorsa) sonuçlar sessizce gerçek rotayla
-      // güncellensin diye mevcut arama tekrar çalıştırılır.
-      //
-      // İKİ AYRI GRAF: ana rota (transitGraph) SADECE resmi hatlarla (EGO
-      // otobüs/metro/Ankaray/Başkentray) hesaplanır — dolmuş, resmi olmayan/
-      // gayriresmi bir hizmet olduğu için ana süreye/sıralamaya sessizce
-      // karışmıyor. transitGraphWithDolmus, SADECE "dolmuşla alternatif var
-      // mı" kontrolü için kullanılan ikinci, dolmuş dahil tam graf.
-      transitGraph = buildTransitGraph(data, { excludeModes: new Set(["dolmus"]) });
-      transitGraphWithDolmus = buildTransitGraph(data, {});
-      if (typeof runSearch === "function") runSearch();
-      return data;
-    })
+    .then(([egoData, dolmusData]) =>
+      installTransitNetwork({
+        stops: (egoData.stops || []).concat((dolmusData && dolmusData.stops) || []),
+        lines: (egoData.lines || []).concat((dolmusData && dolmusData.lines) || []),
+      })
+    )
     .catch(() => null);
   return localTransitNetworkPromise;
 }
-loadLocalTransitNetwork(); // sayfa açılışında arka planda hemen başlat
+if (!window.SUPABASE_CONFIG) loadLocalTransitNetwork();
 
 // Hat geometrileri (gerçek güzergah şekilleri) ayrı, biraz daha büyük bir
 // dosyada (transit_network_geometry.json, ~1.8MB, seyreltilmiş) tutuluyor ve
@@ -1442,7 +1493,9 @@ function loadLocalTransitGeometry() {
     .catch(() => null);
   return localTransitGeometryPromise;
 }
-loadLocalTransitNetwork().then(() => loadLocalTransitGeometry());
+if (!window.SUPABASE_CONFIG) {
+  loadLocalTransitNetwork().then(() => loadLocalTransitGeometry());
+}
 
 /**
  * discoverNearbyTransit ile AYNI sözleşmeye sahip ({stops, lines, nearestStopName})
@@ -1725,7 +1778,10 @@ function durationBucket(min) {
   return { key: "bad", label: "60+ dk", color: "#dc2626" };
 }
 
-const MODE_ICON = { metro: "🚇", ankaray: "🚊", tren: "🚆", otobus: "🚌", dolmus: "🚐", hub: "📍" };
+const MODE_ICON = {
+  metro: "🚇", ankaray: "🚊", tren: "🚆", otobus: "🚌", dolmus: "🚐", hub: "📍",
+  tramvay: "🚋", marmaray: "🚆", metrobus: "🚌", funikuler: "🚞", vapur: "⛴️",
+};
 // 2026-09-25: harita çizim rengi TEK bir kurumsal Google Haritalar mavisine
 // (#1a73e8) indirgendi — otobüs/metro/Ankaray/Başkentray FARK ETMEKSİZİN.
 // Önceki sürüm modlara göre ayrı renk veriyordu (metro kırmızı, Ankaray
@@ -1847,8 +1903,11 @@ const projectCluster = L.markerClusterGroup({
 const projectMarkersById = {};
 
 function buildProjectMarker(p) {
+  const lat = Number(p.lat);
+  const lng = Number(p.lng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return null;
   const isUrgent = URGENT_PROJECT_IDS.has(p.id);
-  const m = L.marker([p.lat, p.lng], { icon: isUrgent ? urgentProjectIcon : projectIcon });
+  const m = L.marker([lat, lng], { icon: isUrgent ? urgentProjectIcon : projectIcon });
   m.bindTooltip(`${isUrgent ? "🔴 ACİL — " : ""}${p.name} — ${p.address}`, { direction: "top" });
   projectMarkersById[p.id] = m;
   if (!INACTIVE_PROJECT_IDS.has(p.id)) {
@@ -1895,7 +1954,7 @@ const projectPanel = document.getElementById("panel-project");
 const originSelect = document.getElementById("originSelect");
 const projectSelect = document.getElementById("projectSelect");
 const thresholdButtons = document.querySelectorAll(".threshold-btn[data-threshold]");
-const positionButtons = document.querySelectorAll(".position-btn");
+const positionFilters = document.getElementById("positionFilters");
 const resultsList = document.getElementById("resultsList");
 const resultsHeading = document.getElementById("resultsHeading");
 const emptyState = document.getElementById("emptyState");
@@ -1932,22 +1991,27 @@ function applyPositionFilter(projects) {
 }
 const enrichedOriginIds = new Set(); // canlı Overpass sorgusu zaten yapılmış origin id'leri
 
-// Select doldur
-ANKARA_DATA.districts.forEach((d) => {
-  const optGroup = document.createElement("optgroup");
-  optGroup.label = d.name;
-  const districtOpt = document.createElement("option");
-  districtOpt.value = d.id;
-  districtOpt.textContent = `${d.name} (ilçe merkezi)`;
-  optGroup.appendChild(districtOpt);
-  (d.neighborhoods || []).forEach((n) => {
-    const opt = document.createElement("option");
-    opt.value = n.id;
-    opt.textContent = n.name;
-    optGroup.appendChild(opt);
+function rebuildOriginSelect() {
+  const previouslySelected = originSelect.value;
+  originSelect.innerHTML = '<option value="">Seçiniz…</option>';
+  (ANKARA_DATA.districts || []).forEach((d) => {
+    const optGroup = document.createElement("optgroup");
+    optGroup.label = d.name;
+    const districtOpt = document.createElement("option");
+    districtOpt.value = d.id;
+    districtOpt.textContent = `${d.name} (ilçe merkezi)`;
+    optGroup.appendChild(districtOpt);
+    (d.neighborhoods || []).forEach((n) => {
+      const opt = document.createElement("option");
+      opt.value = n.id;
+      opt.textContent = n.name;
+      optGroup.appendChild(opt);
+    });
+    originSelect.appendChild(optGroup);
   });
-  originSelect.appendChild(optGroup);
-});
+  if (previouslySelected) originSelect.value = previouslySelected;
+}
+rebuildOriginSelect();
 
 // Kapalı (pasif) projeler bu kutuda hiç görünmez; aktiflik "Proje Aç/Kapa"
 // penceresinden değiştirildiğinde bu fonksiyon yeniden çağrılarak kutu
@@ -1992,7 +2056,8 @@ modeButtons.forEach((btn) => {
     // Hem "Proje -> Aday Havuzu" hem "Proje -> Gerçek Adaylar" aynı proje
     // seçim kutusunu (panel-project) kullanır.
     projectPanel.classList.toggle("hidden", currentMode === "origin-to-project");
-    clearResults();
+    if (currentMode === "origin-to-project") renderProjectCatalog();
+    else clearResults();
     // "Proje -> Gerçek Adaylar" harita/sidebar yerine tam ekran ayrı bir
     // görünümde açılır (candidates.js) — 209+ aday cramped bir listeye
     // sığmıyor, aday detayı da ayrı bir panelde gösterilmesi gerekiyordu.
@@ -2010,24 +2075,43 @@ thresholdButtons.forEach((btn) => {
   });
 });
 
-positionButtons.forEach((btn) => {
-  btn.addEventListener("click", () => {
-    currentPositionFilter = btn.dataset.position === "all" ? null : btn.dataset.position;
-    positionButtons.forEach((b) => b.classList.toggle("threshold-btn-active", b === btn));
-    rebuildProjectSelect();
-    // candidates.js app.js'ten SONRA yüklenir — ilk çağrıda henüz tanımlı
-    // olmayabilir, o yüzden varlığı kontrol edilir (bkz. toggleCandidateFullscreen deseni).
-    if (typeof populateCandidateFsProjectSelect === "function") populateCandidateFsProjectSelect();
-    if (
-      (currentMode === "project-to-origin" || currentMode === "project-to-candidates") &&
-      projectSelect.value &&
-      !applyPositionFilter(activeProjects()).some((p) => p.id === projectSelect.value)
-    ) {
-      clearResults();
-    } else {
-      runSearch();
-    }
+function rebuildPositionFilters() {
+  if (!positionFilters) return;
+  const positions = [];
+  (ANKARA_DATA.projects || []).forEach((p) => {
+    if (p.position && !positions.includes(p.position)) positions.push(p.position);
   });
+  if (currentPositionFilter && !positions.includes(currentPositionFilter)) currentPositionFilter = null;
+  positionFilters.innerHTML = "";
+  const make = (value, label, active) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "threshold-btn position-btn" + (active ? " threshold-btn-active" : "");
+    btn.dataset.position = value;
+    btn.textContent = label;
+    positionFilters.appendChild(btn);
+  };
+  make("all", "Tümü", !currentPositionFilter);
+  positions.forEach((pos) => make(pos, pos, currentPositionFilter === pos));
+}
+rebuildPositionFilters();
+
+if (positionFilters) positionFilters.addEventListener("click", (event) => {
+  const btn = event.target.closest(".position-btn");
+  if (!btn || !positionFilters.contains(btn)) return;
+  currentPositionFilter = btn.dataset.position === "all" ? null : btn.dataset.position;
+  positionFilters.querySelectorAll(".position-btn").forEach((b) => b.classList.toggle("threshold-btn-active", b === btn));
+  rebuildProjectSelect();
+  if (typeof populateCandidateFsProjectSelect === "function") populateCandidateFsProjectSelect();
+  if (
+    (currentMode === "project-to-origin" || currentMode === "project-to-candidates") &&
+    projectSelect.value &&
+    !applyPositionFilter(activeProjects()).some((p) => p.id === projectSelect.value)
+  ) {
+    clearResults();
+  } else {
+    runSearch();
+  }
 });
 
 originSelect.addEventListener("change", runSearch);
@@ -2194,9 +2278,65 @@ function resetDistrictMarkers() {
   for (const k in districtMarkersById) delete districtMarkersById[k];
 }
 
+function projectTerms(project) {
+  let age = "";
+  if (project.ageRange && project.ageRange.min != null && project.ageRange.max != null) {
+    age = `${project.ageRange.min}–${project.ageRange.max}`;
+  } else if (project.ageMin != null && project.ageMin !== "" && project.ageMax != null && project.ageMax !== "") {
+    age = `${project.ageMin}–${project.ageMax}`;
+  }
+  return {
+    salary: project.salary,
+    meal: project.meal,
+    transport: project.transport,
+    shift: project.shift,
+    gender: project.gender,
+    position: project.position,
+    capacity: project.capacity,
+    age,
+  };
+}
+
+function renderProjectCatalog() {
+  routesLayer.clearLayers();
+  resetDistrictMarkers();
+  routeDetail.classList.add("hidden");
+  nearbyLinesPanel.classList.add("hidden");
+  const projects = applyPositionFilter(activeProjects())
+    .slice()
+    .sort((a, b) => {
+      const aUrgent = URGENT_PROJECT_IDS.has(a.id) ? 1 : 0;
+      const bUrgent = URGENT_PROJECT_IDS.has(b.id) ? 1 : 0;
+      if (aUrgent !== bUrgent) return bUrgent - aUrgent;
+      return a.name.localeCompare(b.name, "tr");
+    });
+  emptyState.classList.toggle("hidden", projects.length > 0);
+  resultsHeading.textContent = projects.length ? `Açık Projeler (${projects.length})` : "";
+  resultsList.innerHTML = "";
+  projects.forEach((project) => {
+    resultsList.appendChild(
+      buildResultCard({
+        title: project.name,
+        subtitle: [project.sector, project.address].filter(Boolean).join(" · "),
+        terms: projectTerms(project),
+        urgent: URGENT_PROJECT_IDS.has(project.id),
+        referral: project.referral,
+        onClick: () => {
+          const lat = Number(project.lat);
+          const lng = Number(project.lng);
+          if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+          map.setView([lat, lng], 14);
+          const marker = projectMarkersById[project.id];
+          if (marker) marker.openTooltip();
+        },
+      })
+    );
+  });
+}
+
 function runSearch() {
   if (currentMode === "origin-to-project") {
-    if (!originSelect.value) return clearResults();
+    if (!originSelect.value) return renderProjectCatalog();
     renderOriginToProject(originSelect.value);
   } else if (currentMode === "project-to-candidates") {
     // candidates.js içinde tanımlanır — Excel'den yüklenen gerçek adayları
@@ -2238,13 +2378,7 @@ function renderOriginToProject(originId) {
         durationMin: row.durationMin,
         transfers: row.transfers,
         bucket,
-        terms: {
-          salary: row.project.salary,
-          meal: row.project.meal,
-          transport: row.project.transport,
-          shift: row.project.shift,
-          gender: row.project.gender,
-        },
+        terms: projectTerms(row.project),
         urgent: URGENT_PROJECT_IDS.has(row.project.id),
         referral: row.project.referral,
         onClick: () => {
@@ -2415,13 +2549,19 @@ function buildResultCard({ title, subtitle, durationMin, transfers, bucket, onCl
     ? `<div class="result-card-servis-note">🚐 Bu projede firma servisi var — yukarıdaki süre/aktarma toplu taşıma senaryosuna göredir, gerçek servis güzergahı sisteme kayıtlı değil.</div>`
     : "";
   const genderSpan = terms && terms.gender ? `<span>👤 ${terms.gender}</span>` : "";
+  const positionSpan = terms && terms.position ? `<span>🏷️ ${terms.position}</span>` : "";
+  const capacitySpan = terms && terms.capacity ? `<span>👥 ${terms.capacity}</span>` : "";
+  const ageSpan = terms && terms.age ? `<span>🎂 ${terms.age}</span>` : "";
   const termsRow = terms
     ? `<div class="result-card-terms">
+        ${positionSpan}
         <span>💰 ${terms.salary}</span>
         <span>🍽️ ${terms.meal}</span>
         <span>🚌 ${terms.transport}</span>
         <span>⏰ ${terms.shift}</span>
         ${genderSpan}
+        ${capacitySpan}
+        ${ageSpan}
       </div>`
     : "";
   const urgentBadge = urgent ? `<span class="result-card-urgent-badge">ACİL</span>` : "";
@@ -2432,10 +2572,14 @@ function buildResultCard({ title, subtitle, durationMin, transfers, bucket, onCl
         <div class="font-semibold text-slate-800 truncate">${title}</div>
         <div class="text-xs text-slate-500 truncate">${subtitle}</div>
       </div>
-      <div class="flex flex-col items-end shrink-0">
+      ${
+        durationMin == null
+          ? ""
+          : `<div class="flex flex-col items-end shrink-0">
         <span class="duration-badge" data-role="duration" style="background:${bucket.color}1a; color:${bucket.color}">~${durationMin} dk</span>
         <span class="text-[11px] text-slate-400 mt-1">${transfers} aktarma</span>
-      </div>
+      </div>`
+      }
     </div>
     ${referralRow}
     ${termsRow}
@@ -3389,7 +3533,7 @@ addProjectForm.addEventListener("submit", async (e) => {
     rebuildProjectSelect();
     saveProjectsCache();
     closeAddProjectModal();
-    if (currentMode === "origin-to-project" && originSelect.value) runSearch();
+    if (currentMode === "origin-to-project") runSearch();
   } catch (err) {
     addProjectStatus.textContent = "Kaydedilemedi — internet bağlantısını kontrol edip tekrar dene.";
   } finally {
@@ -3397,6 +3541,45 @@ addProjectForm.addEventListener("submit", async (e) => {
   }
 });
 
-// İlk yükleme
-clearResults();
-loadLiveProjects();
+/**
+ * Seçilen şirketin bölgesini haritaya ve rota motoruna uygular.
+ * Hatlar ve noktalar çağıran tarafta company_id + region_id ile çekilmiş olmalı.
+ */
+function applySupabaseRegion(bundle) {
+  window.usingSupabaseTenant = true;
+  const region = bundle.region || {};
+  ANKARA_DATA.projects = (bundle.projects || []).map(normalizeProjectRecord);
+  ANKARA_DATA.districts = bundle.districts || [];
+  ANKARA_DATA.transitStops = bundle.transitStops || [];
+  ANKARA_DATA.transitLines = bundle.transitLines || [];
+  ANKARA_DATA.hubStopIds = bundle.hubStopIds || [];
+  ANKARA_DATA.urgentProjectIds = ANKARA_DATA.projects.filter((p) => p.urgent).map((p) => p.id);
+  stopApproxCoordsCache = null;
+  recomputeUrgentInactiveSets();
+  rebuildTransitIndexes();
+  rebuildAllProjectMarkers();
+  rebuildOriginSelect();
+  rebuildPositionFilters();
+  rebuildProjectSelect();
+  TransitCache.clearAll();
+  routesLayer.clearLayers();
+  const subtitle = document.getElementById("moduleSubtitle");
+  if (subtitle) subtitle.textContent = `İK saha personeli işe alım — ${region.name || "bölge"}`;
+  if (region.center_lat != null && region.center_lng != null) {
+    map.setView([Number(region.center_lat), Number(region.center_lng)], 11);
+  }
+  installTransitNetwork(bundle.network || { stops: [], lines: [] }, { silent: true });
+  if (window.CandidateStore && typeof CandidateStore.bindRegion === "function") {
+    CandidateStore.bindRegion(region.slug);
+    if (bundle.candidates && bundle.candidates.length && CandidateStore.all().length === 0) {
+      CandidateStore.upsertBatch(bundle.candidates);
+    }
+  }
+  if (currentMode === "origin-to-project" && !originSelect.value) renderProjectCatalog();
+  else runSearch();
+}
+
+// İlk yükleme. Supabase ayarı varsa tenant.js bölgeyi çeker;
+// yoksa eski Sheet/yerel ağ yedeği devreye girer.
+renderProjectCatalog();
+if (!window.SUPABASE_CONFIG) loadLiveProjects();
